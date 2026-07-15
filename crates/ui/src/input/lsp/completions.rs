@@ -124,18 +124,68 @@ impl InputState {
         self.schedule_inline_completion(window, cx);
 
         let start = range.end;
-        let new_offset = self.cursor();
-
         if !provider.is_completion_trigger(start, new_text, cx) {
             return;
         }
+
+        self.request_completions_at(
+            start,
+            self.cursor(),
+            lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
+            window,
+            cx,
+        );
+    }
+
+    /// Requests completion at the current cursor without changing the input text.
+    ///
+    /// Returns `true` when a completion provider is configured and the request was
+    /// scheduled. Disabled inputs and inputs without a provider return `false`.
+    pub fn request_completions(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.disabled || self.lsp.completion_provider.is_none() {
+            return false;
+        }
+
+        let offset = self.cursor();
+        self.request_completions_at(
+            offset,
+            offset,
+            lsp_types::CompletionTriggerKind::INVOKED,
+            window,
+            cx,
+        );
+        true
+    }
+
+    pub(crate) fn on_action_show_completions(
+        &mut self,
+        _: &crate::input::ShowCompletions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.request_completions(window, cx) {
+            cx.propagate();
+        }
+    }
+
+    fn request_completions_at(
+        &mut self,
+        start: usize,
+        new_offset: usize,
+        trigger_kind: lsp_types::CompletionTriggerKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.lsp.completion_provider.clone() else {
+            return;
+        };
 
         let menu = match self.context_menu_content.as_ref() {
             Some(ContextMenu::Completion(menu)) => Some(menu),
             _ => None,
         };
 
-        // To create or get the existing completion menu.
+        // Create or get the existing completion menu.
         let menu = match menu {
             Some(menu) => menu.clone(),
             None => {
@@ -145,7 +195,13 @@ impl InputState {
             }
         };
 
-        let start_offset = menu.read(cx).trigger_start_offset.unwrap_or(start);
+        let invoked = trigger_kind == lsp_types::CompletionTriggerKind::INVOKED;
+        let start_offset = if invoked {
+            _ = menu.update(cx, |menu, cx| menu.hide(cx));
+            new_offset
+        } else {
+            menu.read(cx).trigger_start_offset.unwrap_or(start)
+        };
         if new_offset < start_offset {
             return;
         }
@@ -164,8 +220,8 @@ impl InputState {
         });
 
         let completion_context = CompletionContext {
-            trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
-            trigger_character: Some(query),
+            trigger_kind,
+            trigger_character: (!invoked).then_some(query),
         };
 
         let provider_responses =
@@ -306,5 +362,116 @@ impl InputState {
         let completion_text = completion_item.insert_text;
         self.replace_text_in_range_silent(Some(range_utf16), &completion_text, window, cx);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{AppContext, Context, TestAppContext, VisualTestContext, Window};
+
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ObservedCompletionRequest {
+        text: String,
+        offset: usize,
+        context: CompletionContext,
+    }
+
+    struct RecordingCompletionProvider {
+        observed: Rc<RefCell<Option<ObservedCompletionRequest>>>,
+    }
+
+    impl CompletionProvider for RecordingCompletionProvider {
+        fn completions(
+            &self,
+            text: &Rope,
+            offset: usize,
+            context: CompletionContext,
+            _: &mut Window,
+            _: &mut Context<InputState>,
+        ) -> Task<Result<CompletionResponse>> {
+            self.observed.replace(Some(ObservedCompletionRequest {
+                text: text.to_string(),
+                offset,
+                context,
+            }));
+            Task::ready(Ok(CompletionResponse::Array(Vec::new())))
+        }
+
+        fn is_completion_trigger(&self, _: usize, _: &str, _: &mut Context<InputState>) -> bool {
+            false
+        }
+    }
+
+    #[gpui::test]
+    fn explicit_completion_requests_at_cursor_without_editing(cx: &mut TestAppContext) {
+        let observed = Rc::new(RefCell::new(None));
+        let provider = RecordingCompletionProvider {
+            observed: observed.clone(),
+        };
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::init(cx);
+                input = Some(cx.new(|cx| {
+                    let mut state = InputState::new(window, cx).default_value("value.cl");
+                    state.lsp.completion_provider = Some(Rc::new(provider));
+                    state
+                }));
+                cx.new(|cx| crate::Root::new(input.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range("value.cl".len().."value.cl".len(), cx);
+                assert!(state.request_completions(window, cx));
+                assert_eq!(state.value().as_ref(), "value.cl");
+            });
+        });
+
+        assert_eq!(
+            observed.borrow().as_ref(),
+            Some(&ObservedCompletionRequest {
+                text: "value.cl".to_string(),
+                offset: "value.cl".len(),
+                context: CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+            })
+        );
+    }
+
+    #[gpui::test]
+    fn explicit_completion_is_disabled_without_a_mutable_provider(cx: &mut TestAppContext) {
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::init(cx);
+                input = Some(cx.new(|cx| InputState::new(window, cx)));
+                cx.new(|cx| crate::Root::new(input.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert!(!state.request_completions(window, cx));
+                state.lsp.completion_provider = Some(Rc::new(RecordingCompletionProvider {
+                    observed: Rc::new(RefCell::new(None)),
+                }));
+                state.disabled = true;
+                assert!(!state.request_completions(window, cx));
+            });
+        });
     }
 }
