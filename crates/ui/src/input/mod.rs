@@ -25,9 +25,9 @@ pub use gpui_base::input::{
     MoveToEnd, MoveToEndOfLine, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveToStartOfLine,
     MoveUp, Outdent, OutdentInline, Paste, Point, Redo, Replace, Rope, RopeExt, RopeLines, Search,
     SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
-    SelectToStart, SelectToStartOfLine, Selection, ShowCharacterPalette, ShowDocumentHandler,
-    TabSize, TextDecoration, TextDecorationCollection, TextareaState, ToggleCodeActions, Undo,
-    WrappingIndent,
+    SelectToStart, SelectToStartOfLine, Selection, ShowCharacterPalette, ShowCompletions,
+    ShowDocumentHandler, TabSize, TextDecoration, TextDecorationCollection, TextareaState,
+    ToggleCodeActions, Undo, WrappingIndent,
 };
 pub use gpui_base::input::{EditorMode, InputMode, InputModeKind, TextareaMode};
 #[doc(hidden)]
