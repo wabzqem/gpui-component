@@ -2812,6 +2812,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.update_search(cx);
+        M::on_text_mutated(self, cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
@@ -2919,6 +2920,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
+        M::on_text_mutated(self, cx);
         self.push_history(
             &old_text,
             &range,

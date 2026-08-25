@@ -14,6 +14,9 @@ use crate::input::{CompletionMenuState, CompletionProvider, InputExtras};
 pub struct InputCompletionExtras {
     pub(crate) provider: Option<Rc<dyn CompletionProvider>>,
     pub(crate) menu: CompletionMenuState,
+    /// Monotonically changes whenever the input invalidates its completion view.
+    /// Pending responses capture this so they cannot revive stale results.
+    pub(crate) revision: u64,
     pub(crate) task: Task<Result<()>>,
 }
 
@@ -24,6 +27,7 @@ impl Default for InputCompletionExtras {
         Self {
             provider: None,
             menu: CompletionMenuState::default(),
+            revision: 0,
             task: Task::ready(Ok(())),
         }
     }
@@ -102,6 +106,7 @@ impl InputState {
         let Some(provider) = self.extras.provider.clone() else {
             return;
         };
+        let request_revision = self.invalidate_completion_results(cx);
 
         let invoked = trigger_kind == lsp_types::CompletionTriggerKind::INVOKED;
         let start_offset = if invoked {
@@ -127,6 +132,7 @@ impl InputState {
             trigger_kind,
             trigger_character: (!invoked).then_some(query),
         };
+        let request_text = self.text.to_string();
         let responses =
             provider.completions(&self.text, new_offset, completion_context, window, cx);
         self.extras.task = cx.spawn_in(window, async move |input, cx| {
@@ -139,7 +145,11 @@ impl InputState {
             }
             input
                 .update_in(cx, |input, window, cx| {
-                    if !input.focus_handle.is_focused(window) {
+                    if !input.focus_handle.is_focused(window)
+                        || input.extras.revision != request_revision
+                        || input.cursor() != new_offset
+                        || input.text.to_string() != request_text
+                    {
                         return;
                     }
                     input.extras.menu.items = items;
@@ -157,17 +167,29 @@ impl InputState {
         &self.extras.menu
     }
 
-    pub(crate) fn hide_completion_menu(&mut self, cx: &mut Context<Self>) {
+    /// Drops all displayed and pending completion results for the current input.
+    ///
+    /// A completion item can replace the entire value, so keeping an item after
+    /// the text changes would allow it to overwrite newer input. The revision
+    /// also makes a response from a task that outlives cancellation harmless.
+    pub(crate) fn invalidate_completion_results(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.extras.revision = self.extras.revision.wrapping_add(1);
         self.extras.menu.open = false;
+        self.extras.menu.items.clear();
+        self.extras.menu.trigger_start_offset = None;
+        self.extras.menu.query.clear();
+        self.extras.menu.bump();
         self.extras.task = Task::ready(Ok(()));
         cx.notify();
+        self.extras.revision
+    }
+
+    pub(crate) fn hide_completion_menu(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_completion_results(cx);
     }
 
     pub fn dismiss_completion_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.extras.menu.open {
-            self.extras.menu.open = false;
-            cx.notify();
-        }
+        self.invalidate_completion_results(cx);
     }
 
     pub(crate) fn is_completion_menu_open(&self) -> bool {
@@ -213,7 +235,10 @@ mod tests {
     };
     use lsp_types::{CompletionContext, CompletionResponse};
 
-    use crate::input::{CompletionProvider, InputState, Rope};
+    use crate::{
+        async_util::{Receiver, unbounded},
+        input::{CompletionProvider, Enter, InputState, Rope},
+    };
 
     struct Harness(Entity<InputState>);
 
@@ -274,6 +299,40 @@ mod tests {
         }
     }
 
+    struct DelayedProvider(Rc<RefCell<Vec<Receiver<CompletionResponse>>>>);
+
+    impl CompletionProvider for DelayedProvider {
+        fn completions(
+            &self,
+            _: &Rope,
+            _: usize,
+            _: CompletionContext,
+            _: &mut Window,
+            cx: &mut App,
+        ) -> Task<Result<CompletionResponse>> {
+            let response = self.0.borrow_mut().remove(0);
+            cx.spawn(async move |_| Ok(response.recv().await.expect("completion response sent")))
+        }
+
+        fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
+            !new_text.is_empty()
+        }
+    }
+
+    fn full_input_completion(value: &str) -> CompletionResponse {
+        CompletionResponse::Array(vec![lsp_types::CompletionItem {
+            label: format!("{value} replacement"),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, value.len() as u32),
+                ),
+                new_text: format!("{value}-selected"),
+            })),
+            ..Default::default()
+        }])
+    }
+
     #[gpui::test]
     fn single_line_input_explicitly_requests_its_completion_provider(cx: &mut TestAppContext) {
         let observed = Rc::new(RefCell::new(None));
@@ -309,6 +368,102 @@ mod tests {
             })
         );
     }
+    #[gpui::test]
+    fn text_mutation_invalidates_stale_full_input_completion_results(cx: &mut TestAppContext) {
+        let (a_sender, a_response) = unbounded();
+        let (b_sender, b_response) = unbounded();
+        let (c_sender, c_response) = unbounded();
+        let provider = DelayedProvider(Rc::new(RefCell::new(vec![
+            a_response, b_response, c_response,
+        ])));
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::init(cx);
+                input = Some(cx.new(|cx| {
+                    let mut state = InputState::new(window, cx);
+                    state.set_completion_provider(Rc::new(provider));
+                    state
+                }));
+                cx.new(|_| Harness(input.clone().unwrap()))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+
+        // A delayed response for A opens a full-input replacement menu.
+        cx.simulate_input("A");
+        a_sender.try_send(full_input_completion("A")).unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(state.completion_menu_state().open);
+                assert_eq!(state.completion_menu_state().items.len(), 1);
+            });
+        });
+
+        // Typing B schedules a replacement request, but A's menu disappears
+        // immediately rather than staying selectable while that request waits.
+        cx.simulate_input("B");
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.value(), "AB");
+                assert!(!state.completion_menu_state().open);
+                assert!(state.completion_menu_state().items.is_empty());
+            });
+        });
+        cx.dispatch_action(Enter {
+            secondary: false,
+            shift: false,
+        });
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_eq!(state.value(), "AB")));
+
+        // Deletion does not need to requery, but it still invalidates B's
+        // pending replacement and leaves no earlier full-input item selectable.
+        cx.dispatch_action(crate::input::Backspace);
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.value(), "A");
+                assert!(!state.completion_menu_state().open);
+                assert!(state.completion_menu_state().items.is_empty());
+            });
+        });
+        // A cancellation-resistant provider may still finish its own work, so
+        // the implementation also checks revision/value/cursor before applying
+        // any result. A cancellable test task may already have dropped its
+        // receiver here; either way it cannot restore a menu.
+        let _ = b_sender.try_send(full_input_completion("AB"));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.value(), "A");
+                assert!(!state.completion_menu_state().open);
+                assert!(state.completion_menu_state().items.is_empty());
+            });
+        });
+
+        // A result for the current text can still appear after stale responses
+        // have been invalidated.
+        cx.simulate_input("C");
+        c_sender.try_send(full_input_completion("AC")).unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(state.completion_menu_state().open);
+                assert_eq!(
+                    state.completion_menu_state().items[0].label,
+                    "AC replacement"
+                );
+            });
+        });
+    }
+
     #[gpui::test]
     fn single_line_input_automatically_triggers_completion_after_typed_character(
         cx: &mut TestAppContext,

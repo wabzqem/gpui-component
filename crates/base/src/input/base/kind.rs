@@ -233,6 +233,13 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     ) {
     }
 
+    /// Invalidates mode-specific results derived from the prior input value.
+    fn on_text_mutated(
+        _state: &mut InputBaseState<Self>,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+    }
+
     /// Offers freshly typed text to the completion engine.
     fn on_text_typed(
         _state: &mut InputBaseState<Self>,
@@ -310,6 +317,13 @@ impl InputModeKind for InputMode {
     /// A single-line field may opt into a lightweight completion menu. This is
     /// deliberately distinct from EditorState's LSP and source-editor extras.
     type Extras = crate::input::InputCompletionExtras;
+
+    fn on_text_mutated(
+        state: &mut InputBaseState<Self>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.invalidate_completion_results(cx);
+    }
 
     fn on_text_typed(
         state: &mut InputBaseState<Self>,
