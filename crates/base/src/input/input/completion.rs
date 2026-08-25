@@ -201,3 +201,81 @@ impl InputState {
         handled
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use anyhow::Result;
+    use gpui::{
+        App, AppContext as _, Context, Entity, ParentElement as _, Render, Task, TestAppContext,
+        Window, div,
+    };
+    use lsp_types::{CompletionContext, CompletionResponse};
+
+    use crate::input::{CompletionProvider, InputState, Rope};
+
+    struct Harness(Entity<InputState>);
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            div().child(self.0.clone())
+        }
+    }
+
+    struct RecordingProvider(Rc<RefCell<Option<CompletionContext>>>);
+
+    impl CompletionProvider for RecordingProvider {
+        fn completions(
+            &self,
+            _: &Rope,
+            _: usize,
+            context: CompletionContext,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Task<Result<CompletionResponse>> {
+            self.0.replace(Some(context));
+            Task::ready(Ok(CompletionResponse::Array(Vec::new())))
+        }
+
+        fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
+            false
+        }
+    }
+
+    #[gpui::test]
+    fn single_line_input_explicitly_requests_its_completion_provider(cx: &mut TestAppContext) {
+        let observed = Rc::new(RefCell::new(None));
+        let provider = RecordingProvider(observed.clone());
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::init(cx);
+                input = Some(cx.new(|cx| {
+                    let mut state = InputState::new(window, cx).default_value("tower");
+                    state.set_completion_provider(Rc::new(provider));
+                    state
+                }));
+                cx.new(|_| Harness(input.clone().unwrap()))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range("tower".len().."tower".len(), cx);
+                assert!(state.request_completions(window, cx));
+            });
+        });
+
+        assert_eq!(
+            *observed.borrow(),
+            Some(CompletionContext {
+                trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            })
+        );
+    }
+}
