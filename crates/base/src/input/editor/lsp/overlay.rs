@@ -22,7 +22,7 @@ impl CompletionMenuState {
         self.revision
     }
 
-    pub(super) fn bump(&mut self) {
+    pub(crate) fn bump(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
 }
@@ -40,7 +40,7 @@ impl CodeActionMenuState {
         self.revision
     }
 
-    pub(super) fn bump(&mut self) {
+    pub(crate) fn bump(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
 }
@@ -123,32 +123,6 @@ impl InputBaseState<EditorMode> {
         }
     }
 
-    pub fn route_overlay_action(
-        &mut self,
-        action: Box<dyn gpui::Action>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.handle_action_for_context_menu(action, window, cx)
-    }
-
-    pub fn set_overlay_action_handler(
-        &mut self,
-        handler: impl Fn(
-            InputOverlayKind,
-            Box<dyn gpui::Action>,
-            &mut Window,
-            &mut Context<InputBaseState<EditorMode>>,
-        ) -> bool
-        + 'static,
-    ) {
-        self.overlay_action_handler = Some(Rc::new(handler));
-    }
-
-    pub fn has_overlay_action_handler(&self) -> bool {
-        self.overlay_action_handler.is_some()
-    }
-
     pub fn dismiss_completion_overlay(&mut self, cx: &mut Context<Self>) {
         if self.extras.context_menu_content.completion.open {
             self.extras.context_menu_content.completion.open = false;
@@ -161,39 +135,6 @@ impl InputBaseState<EditorMode> {
             self.extras.context_menu_content.code_action.open = false;
             cx.notify();
         }
-    }
-
-    pub fn insert_completion(
-        &mut self,
-        item: &CompletionItem,
-        fallback_range: Range<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut range = fallback_range;
-        let mut new_text = item.label.clone();
-        if let Some(edit) = item.text_edit.as_ref() {
-            match edit {
-                lsp_types::CompletionTextEdit::Edit(edit) => {
-                    new_text.clone_from(&edit.new_text);
-                    range = self.text.position_to_offset(&edit.range.start)
-                        ..self.text.position_to_offset(&edit.range.end);
-                }
-                lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                    new_text.clone_from(&edit.new_text);
-                    range = self.text.position_to_offset(&edit.replace.start)
-                        ..self.text.position_to_offset(&edit.replace.end);
-                }
-            }
-        } else if let Some(insert_text) = item.insert_text.as_ref() {
-            new_text.clone_from(insert_text);
-            range = range.end..range.end;
-        }
-        self.completion_inserting = true;
-        let range = self.range_to_utf16(&range);
-        self.replace_text_in_range_silent(Some(range), &new_text, window, cx);
-        self.completion_inserting = false;
-        self.focus(window, cx);
     }
 
     #[doc(hidden)]

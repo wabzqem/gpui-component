@@ -76,6 +76,7 @@ pub use highlighting::{
     InputHighlighterFactory, SharedHighlightStyleResolver,
 };
 pub use indent::TabSize;
+pub(crate) use input::InputCompletionExtras;
 pub use input::{Input, InputState};
 pub use kind::{
     EditorExtras, EditorMode, InputExtras, InputMode, InputModeKind, MultiLineMode, TextareaMode,

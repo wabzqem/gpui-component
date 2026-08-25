@@ -26,6 +26,9 @@ impl<M: OverlayMode> Global for InputOverlayRegistry<M> {}
 struct InputOverlayHost<M: OverlayMode> {
     search: Entity<SearchPanel<M>>,
     search_signature: (bool, bool, String, Option<usize>),
+    /// Lightweight completion is available on opt-in single-line fields.
+    completion: Option<Entity<CompletionMenu<M>>>,
+    completion_signature: OverlaySignature,
     /// The language-feature popovers. Only a code editor has them.
     lsp: Option<LspOverlays>,
 }
@@ -47,7 +50,7 @@ struct OverlaySignature {
 /// and diagnostics. They belong to a code editor, so they are built and synced
 /// by [`OverlayMode`], where the state's kind is concrete.
 pub(crate) struct LspOverlays {
-    completion: Entity<CompletionMenu>,
+    completion: Entity<CompletionMenu<crate::input::EditorMode>>,
     code_actions: Entity<CodeActionMenu>,
     hover: Option<Entity<HoverPopover>>,
     diagnostic: Option<Entity<DiagnosticPopover>>,
@@ -62,6 +65,12 @@ pub(crate) struct LspOverlays {
 /// Deliberately free of content: only what is needed to decide whether a
 /// popover is shown and whether it changed. The content is read from the state
 /// again, on the frames where it actually did.
+pub(crate) struct CompletionSnapshot {
+    completion: OverlaySignature,
+    completion_start: Option<usize>,
+    cursor: usize,
+}
+
 pub(crate) struct LspSnapshot {
     completion: OverlaySignature,
     completion_start: Option<usize>,
@@ -97,6 +106,27 @@ pub(crate) trait OverlayMode: InputModeKind + Sized {
     /// Installs the routing that lets an open menu consume actions first.
     fn install_action_handler(_state: &Entity<InputBaseState<Self>>, _cx: &mut App) {}
 
+    fn completion_snapshot(_state: &InputBaseState<Self>, _cx: &App) -> Option<CompletionSnapshot> {
+        None
+    }
+
+    fn build_completion(
+        _state: &Entity<InputBaseState<Self>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Entity<CompletionMenu<Self>>> {
+        None
+    }
+
+    fn sync_completion(
+        _menu: &Entity<CompletionMenu<Self>>,
+        _state: &Entity<InputBaseState<Self>>,
+        _snapshot: &CompletionSnapshot,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
     fn build_lsp(
         _state: &Entity<InputBaseState<Self>>,
         _window: &mut Window,
@@ -115,7 +145,74 @@ pub(crate) trait OverlayMode: InputModeKind + Sized {
     }
 }
 
-impl OverlayMode for crate::input::InputMode {}
+impl OverlayMode for crate::input::InputMode {
+    fn install_action_handler(state: &Entity<InputBaseState<Self>>, cx: &mut App) {
+        let id = state.entity_id();
+        state.update(cx, move |state, _| {
+            state.set_overlay_action_handler(move |kind, action, window, cx| {
+                if kind != gpui_base::input::InputOverlayKind::Completion {
+                    return false;
+                }
+                let menu = cx
+                    .try_global::<InputOverlayRegistry<Self>>()
+                    .and_then(|registry| registry.hosts.get(&id))
+                    .and_then(|(_, host)| host.completion.clone());
+                menu.is_some_and(|menu| {
+                    menu.update(cx, |menu, cx| menu.handle_action(action, window, cx))
+                })
+            });
+        });
+    }
+
+    fn completion_snapshot(state: &InputBaseState<Self>, _cx: &App) -> Option<CompletionSnapshot> {
+        let completion = state.completion_menu_state();
+        Some(CompletionSnapshot {
+            completion: OverlaySignature {
+                open: completion.open,
+                revision: completion.revision(),
+            },
+            completion_start: completion.trigger_start_offset,
+            cursor: state.cursor(),
+        })
+    }
+
+    fn build_completion(
+        state: &Entity<InputBaseState<Self>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<CompletionMenu<Self>>> {
+        Some(CompletionMenu::new(
+            state.clone(),
+            gpui_base::input::CompletionMenuOptions::default().max_width,
+            window,
+            cx,
+        ))
+    }
+
+    fn sync_completion(
+        menu: &Entity<CompletionMenu<Self>>,
+        state: &Entity<InputBaseState<Self>>,
+        snapshot: &CompletionSnapshot,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let open = snapshot.completion.open;
+        let start = snapshot.completion_start;
+        let cursor = snapshot.cursor;
+        let (query, items) = {
+            let menu = state.read(cx).completion_menu_state();
+            (menu.query.clone(), menu.items.clone())
+        };
+        menu.update(cx, |menu, cx| {
+            if open {
+                menu.update_query(start.unwrap_or(cursor), query);
+                menu.show(cursor, items, window, cx);
+            } else {
+                menu.hide(cx);
+            }
+        });
+    }
+}
 impl OverlayMode for crate::input::TextareaMode {}
 
 impl OverlayMode for crate::input::EditorMode {
@@ -170,7 +267,12 @@ impl OverlayMode for crate::input::EditorMode {
         cx: &mut App,
     ) -> Option<LspOverlays> {
         Some(LspOverlays {
-            completion: CompletionMenu::new(state.clone(), window, cx),
+            completion: CompletionMenu::new(
+                state.clone(),
+                state.read(cx).lsp().completion_menu.max_width,
+                window,
+                cx,
+            ),
             code_actions: CodeActionMenu::new(state.clone(), window, cx),
             hover: None,
             diagnostic: None,
@@ -281,6 +383,8 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         Self {
             search: SearchPanel::new(state.clone(), window, cx),
             search_signature: (false, false, String::new(), None),
+            completion: M::build_completion(&state, window, cx),
+            completion_signature: OverlaySignature::default(),
             lsp: M::build_lsp(&state, window, cx),
         }
     }
@@ -291,7 +395,18 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         window: &mut Window,
         cx: &mut App,
     ) -> InputOverlays {
+        let completion_snapshot = M::completion_snapshot(state.read(cx), cx);
         let snapshot = M::lsp_snapshot(state.read(cx), cx);
+        if let (Some(menu), Some(snapshot)) = (&self.completion, completion_snapshot.as_ref()) {
+            if snapshot.completion != self.completion_signature {
+                self.completion_signature = OverlaySignature {
+                    open: snapshot.completion.open,
+                    revision: snapshot.completion.revision,
+                };
+                M::sync_completion(menu, state, snapshot, window, cx);
+            }
+        }
+
         let (search_open, replace_mode, search_session) = {
             let state = state.read(cx);
             let search = state.search_session();
@@ -340,7 +455,12 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         }
 
         let search = search_open.then(|| self.search.clone().into_any_element());
-        let mut floating = Vec::with_capacity(4);
+        let mut floating = Vec::with_capacity(5);
+        if let (Some(menu), Some(snapshot)) = (&self.completion, completion_snapshot.as_ref()) {
+            if snapshot.completion.open {
+                floating.push(menu.clone().into_any_element());
+            }
+        }
         if let (Some(lsp), Some(snapshot)) = (self.lsp.as_ref(), snapshot.as_ref()) {
             if snapshot.completion.open {
                 floating.push(lsp.completion.clone().into_any_element());
@@ -368,6 +488,8 @@ pub(super) fn render_overlays<M: OverlayMode>(
     let has_overlay = {
         let state = state.read(cx);
         state.search_session().open
+            || M::completion_snapshot(state, cx)
+                .is_some_and(|completion| completion.completion.open)
             || M::lsp_snapshot(state, cx).is_some_and(|lsp| lsp.has_overlay())
     };
     if !has_overlay {

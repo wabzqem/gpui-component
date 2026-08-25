@@ -364,8 +364,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) enable_context_menu: bool,
 
     /// A flag to indicate if we are currently inserting a completion item.
-    pub(super) completion_inserting: bool,
-    pub(super) overlay_action_handler: Option<
+    pub(crate) completion_inserting: bool,
+    pub(crate) overlay_action_handler: Option<
         Rc<
             dyn Fn(
                 super::InputOverlayKind,
@@ -5101,6 +5101,69 @@ impl InputBaseState<crate::input::TextareaMode> {
     pub fn auto_grow(mut self, min_rows: usize, max_rows: usize) -> Self {
         self.mode = LayoutMode::auto_grow(min_rows, max_rows);
         self
+    }
+}
+
+/// Shared completion-menu plumbing. The concrete input mode decides whether it
+/// exposes a provider and when it invokes these hooks.
+impl<M: InputModeKind> InputBaseState<M> {
+    pub fn route_overlay_action(
+        &mut self,
+        action: Box<dyn Action>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        M::handle_context_menu_action(self, action, window, cx)
+    }
+
+    pub fn set_overlay_action_handler(
+        &mut self,
+        handler: impl Fn(
+            super::InputOverlayKind,
+            Box<dyn Action>,
+            &mut Window,
+            &mut Context<InputBaseState<M>>,
+        ) -> bool
+        + 'static,
+    ) {
+        self.overlay_action_handler = Some(Rc::new(handler));
+    }
+
+    pub fn has_overlay_action_handler(&self) -> bool {
+        self.overlay_action_handler.is_some()
+    }
+
+    pub fn insert_completion(
+        &mut self,
+        item: &lsp_types::CompletionItem,
+        fallback_range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut range = fallback_range;
+        let mut new_text = item.label.clone();
+        if let Some(edit) = item.text_edit.as_ref() {
+            match edit {
+                lsp_types::CompletionTextEdit::Edit(edit) => {
+                    new_text.clone_from(&edit.new_text);
+                    range = self.text.position_to_offset(&edit.range.start)
+                        ..self.text.position_to_offset(&edit.range.end);
+                }
+                lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
+                    new_text.clone_from(&edit.new_text);
+                    range = self.text.position_to_offset(&edit.replace.start)
+                        ..self.text.position_to_offset(&edit.replace.end);
+                }
+            }
+        } else if let Some(insert_text) = item.insert_text.as_ref() {
+            new_text.clone_from(insert_text);
+            range = range.end..range.end;
+        }
+        self.completion_inserting = true;
+        let range = self.range_to_utf16(&range);
+        self.replace_text_in_range_silent(Some(range), &new_text, window, cx);
+        self.completion_inserting = false;
+        self.focus(window, cx);
     }
 }
 

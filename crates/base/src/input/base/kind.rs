@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{Div, Entity, Stateful, Window};
+use gpui::{Div, Entity, InteractiveElement as _, Stateful, Window};
 use ropey::Rope;
 
 use super::decorations::DecorationCollections;
@@ -307,11 +307,49 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
 impl InputModeKind for InputMode {
     const MULTI_LINE: bool = false;
 
-    /// A single-line field needs nothing beyond the shared engine. Masking,
-    /// validation and number stepping live there: together they are ~120 bytes
-    /// and their access sites sit inside the shared edit path, so separating
-    /// them would cost more in dispatch than it saves.
-    type Extras = ();
+    /// A single-line field may opt into a lightweight completion menu. This is
+    /// deliberately distinct from EditorState's LSP and source-editor extras.
+    type Extras = crate::input::InputCompletionExtras;
+
+    fn on_text_typed(
+        state: &mut InputBaseState<Self>,
+        range: &std::ops::Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.handle_completion_trigger(range, text, window, cx);
+    }
+
+    fn hide_context_menu(
+        state: &mut InputBaseState<Self>,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.hide_completion_menu(cx);
+    }
+
+    fn is_context_menu_open(state: &InputBaseState<Self>, _cx: &gpui::App) -> bool {
+        state.is_completion_menu_open()
+    }
+
+    fn handle_context_menu_action(
+        state: &mut InputBaseState<Self>,
+        action: Box<dyn gpui::Action>,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        state.handle_completion_menu_action(action, window, cx)
+    }
+
+    fn register_actions(
+        element: Stateful<Div>,
+        entity: &Entity<InputBaseState<Self>>,
+        window: &mut Window,
+    ) -> Stateful<Div> {
+        element.on_action(window.listener_for(entity, |state, action, window, cx| {
+            state.on_action_show_input_completions(action, window, cx)
+        }))
+    }
 }
 impl InputModeKind for TextareaMode {
     const MULTI_LINE: bool = true;

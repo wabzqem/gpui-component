@@ -14,21 +14,21 @@ const POPOVER_GAP: Pixels = px(4.);
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
     input::{
-        self, EditorState,
+        self, InputBaseState, InputModeKind,
         popovers::{editor_popover, render_markdown},
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
 };
 
-struct ContextMenuDelegate {
+struct ContextMenuDelegate<M: InputModeKind> {
     query: SharedString,
-    menu: Entity<CompletionMenu>,
+    menu: Entity<CompletionMenu<M>>,
     items: Vec<Rc<CompletionItem>>,
     selected_ix: usize,
 }
 
-impl ContextMenuDelegate {
+impl<M: InputModeKind> ContextMenuDelegate<M> {
     fn set_items(&mut self, items: Vec<CompletionItem>) {
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
@@ -126,9 +126,9 @@ impl RenderOnce for CompletionMenuItem {
     }
 }
 
-impl EventEmitter<DismissEvent> for ContextMenuDelegate {}
+impl<M: InputModeKind> EventEmitter<DismissEvent> for ContextMenuDelegate<M> {}
 
-impl ListDelegate for ContextMenuDelegate {
+impl<M: InputModeKind> ListDelegate for ContextMenuDelegate<M> {
     type Item = CompletionMenuItem;
 
     fn items_count(&self, _: usize, _: &gpui::App) -> usize {
@@ -167,10 +167,11 @@ impl ListDelegate for ContextMenuDelegate {
 }
 
 /// A context menu for code completions and code actions.
-pub struct CompletionMenu {
+pub struct CompletionMenu<M: InputModeKind> {
     offset: usize,
-    editor: WeakEntity<EditorState>,
-    list: Entity<ListState<ContextMenuDelegate>>,
+    input: WeakEntity<InputBaseState<M>>,
+    max_width: Pixels,
+    list: Entity<ListState<ContextMenuDelegate<M>>>,
     open: bool,
 
     /// The offset of the first character that triggered the completion.
@@ -179,12 +180,13 @@ pub struct CompletionMenu {
     _subscriptions: Vec<Subscription>,
 }
 
-impl CompletionMenu {
+impl<M: InputModeKind> CompletionMenu<M> {
     /// Creates a new `CompletionMenu` with the given offset and completion items.
     ///
-    /// NOTE: This element should not call from EditorState::new, unless that will stack overflow.
+    /// NOTE: This element should not be created from input-state construction, unless that will stack overflow.
     pub(crate) fn new(
-        editor: Entity<EditorState>,
+        input: Entity<InputBaseState<M>>,
+        max_width: Pixels,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -214,7 +216,8 @@ impl CompletionMenu {
 
             Self {
                 offset: 0,
-                editor: editor.downgrade(),
+                input: input.downgrade(),
+                max_width,
                 list,
                 open: false,
                 trigger_start_offset: None,
@@ -228,11 +231,11 @@ impl CompletionMenu {
         let item = item.clone();
         let range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
-        let editor = self.editor.clone();
+        let input = self.input.clone();
 
         cx.spawn_in(window, async move |_, cx| {
-            editor.update_in(cx, |editor, window, cx| {
-                editor.insert_completion(&item, range, window, cx);
+            input.update_in(cx, |input, window, cx| {
+                input.insert_completion(&item, range, window, cx);
             })
         })
         .detach();
@@ -293,9 +296,9 @@ impl CompletionMenu {
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         self.trigger_start_offset = None;
-        let editor = self.editor.clone();
+        let input = self.input.clone();
         cx.spawn(async move |_, cx| {
-            let _ = editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+            let _ = input.update(cx, |input, cx| M::hide_context_menu(input, cx));
         })
         .detach();
         cx.notify();
@@ -339,23 +342,23 @@ impl CompletionMenu {
     }
 
     fn origin(&self, cx: &App) -> Option<Point<Pixels>> {
-        let editor = self.editor.upgrade()?;
-        let editor = editor.read(cx);
-        let Some((cursor_bounds, line_height)) = editor.cursor_layout() else {
+        let input = self.input.upgrade()?;
+        let input = input.read(cx);
+        let Some((cursor_bounds, line_height)) = input.cursor_layout() else {
             return None;
         };
         let cursor_origin = cursor_bounds.origin;
 
-        let scroll_origin = editor.scroll_offset();
+        let scroll_origin = input.scroll_offset();
 
         Some(
-            scroll_origin + cursor_origin - editor.input_bounds().origin
+            scroll_origin + cursor_origin - input.input_bounds().origin
                 + Point::new(-px(4.), line_height + px(4.)),
         )
     }
 }
 
-impl Render for CompletionMenu {
+impl<M: InputModeKind> Render for CompletionMenu<M> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return Empty.into_any_element();
@@ -377,12 +380,12 @@ impl Render for CompletionMenu {
             .selected_item()
             .and_then(|item| item.documentation.clone());
 
-        let Some(editor) = self.editor.upgrade() else {
+        let Some(input) = self.input.upgrade() else {
             return Empty.into_any_element();
         };
-        let configured_max = editor.read(cx).lsp().completion_menu.max_width;
+        let configured_max = self.max_width;
         let max_width = configured_max.min(window.bounds().size.width - pos.x);
-        let abs_pos = editor.read(cx).input_bounds().origin + pos;
+        let abs_pos = input.read(cx).input_bounds().origin + pos;
         let vertical_layout =
             abs_pos.x + configured_max + POPOVER_GAP + configured_max + POPOVER_GAP
                 > window.bounds().size.width;

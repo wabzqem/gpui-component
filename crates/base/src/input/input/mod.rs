@@ -2,6 +2,9 @@ use gpui::{App, Entity, IntoElement, RenderOnce, Window};
 
 use super::{InputBaseState, InputMode};
 
+mod completion;
+pub(crate) use completion::InputCompletionExtras;
+
 /// State for a single-line text input.
 ///
 /// This is the shared editing engine in its single-line kind. Multi-line
