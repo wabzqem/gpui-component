@@ -243,6 +243,37 @@ mod tests {
         }
     }
 
+    struct AutomaticTriggerProvider {
+        triggers: Rc<RefCell<Vec<(usize, String)>>>,
+        requests: Rc<RefCell<Vec<CompletionContext>>>,
+    }
+
+    impl CompletionProvider for AutomaticTriggerProvider {
+        fn completions(
+            &self,
+            _: &Rope,
+            _: usize,
+            context: CompletionContext,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Task<Result<CompletionResponse>> {
+            self.requests.borrow_mut().push(context);
+            Task::ready(Ok(CompletionResponse::Array(vec![
+                lsp_types::CompletionItem::new_simple(
+                    "workspace".to_string(),
+                    "Workspace folder".to_string(),
+                ),
+            ])))
+        }
+
+        fn is_completion_trigger(&self, offset: usize, new_text: &str, _: &mut App) -> bool {
+            self.triggers
+                .borrow_mut()
+                .push((offset, new_text.to_string()));
+            new_text == "/"
+        }
+    }
+
     #[gpui::test]
     fn single_line_input_explicitly_requests_its_completion_provider(cx: &mut TestAppContext) {
         let observed = Rc::new(RefCell::new(None));
@@ -277,5 +308,55 @@ mod tests {
                 trigger_character: None,
             })
         );
+    }
+    #[gpui::test]
+    fn single_line_input_automatically_triggers_completion_after_typed_character(
+        cx: &mut TestAppContext,
+    ) {
+        let triggers = Rc::new(RefCell::new(Vec::new()));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = AutomaticTriggerProvider {
+            triggers: triggers.clone(),
+            requests: requests.clone(),
+        };
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                crate::init(cx);
+                input = Some(cx.new(|cx| {
+                    let mut state = InputState::new(window, cx);
+                    state.set_completion_provider(Rc::new(provider));
+                    state
+                }));
+                cx.new(|_| Harness(input.clone().unwrap()))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.focus(window, cx));
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_input("/");
+
+        assert_eq!(
+            *triggers.borrow(),
+            vec![(0, "/".to_string())],
+            "typing the trigger character should consult the provider",
+        );
+        assert_eq!(
+            *requests.borrow(),
+            vec![CompletionContext {
+                trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("/".to_string()),
+            }],
+        );
+        cx.update(|_, cx| {
+            let state = input.read(cx);
+            assert!(state.completion_menu_state().open);
+            assert_eq!(state.completion_menu_state().items.len(), 1);
+        });
     }
 }
